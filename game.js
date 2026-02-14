@@ -126,6 +126,15 @@ function insertHighscore(name, sc, wv, list, shipName) {
 let highscores = loadHighscores();
 
 // ── Supabase Leaderboard Functions ───────────────────────────
+const FETCH_TIMEOUT_MS = 8000;
+
+function fetchWithTimeout(url, options) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    return fetch(url, { ...options, signal: controller.signal })
+        .finally(() => clearTimeout(timeout));
+}
+
 async function fetchLeaderboard() {
     const now = Date.now();
     if (now - lastLeaderboardFetch < LEADERBOARD_CACHE_MS && highscores.length > 0) return;
@@ -133,7 +142,7 @@ async function fetchLeaderboard() {
     leaderboardError = false;
     try {
         const url = `${SUPABASE_URL}/rest/v1/${LEADERBOARD_TABLE}?select=name,score,wave,ship&order=score.desc&limit=${MAX_HIGHSCORES}`;
-        const res = await fetch(url, {
+        const res = await fetchWithTimeout(url, {
             headers: {
                 "apikey": SUPABASE_ANON_KEY,
                 "Authorization": `Bearer ${SUPABASE_ANON_KEY}`,
@@ -141,12 +150,19 @@ async function fetchLeaderboard() {
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        highscores = data.map(row => ({
-            name: row.name,
-            score: row.score,
-            wave: row.wave,
-            ship: row.ship || "",
-        }));
+        if (!Array.isArray(data)) throw new Error("Invalid response");
+        highscores = data
+            .filter(row =>
+                typeof row.name === "string" && row.name.length === NAME_LENGTH &&
+                typeof row.score === "number" && row.score > 0 &&
+                typeof row.wave === "number" && row.wave >= 1
+            )
+            .map(row => ({
+                name: String(row.name).substring(0, NAME_LENGTH),
+                score: Math.floor(row.score),
+                wave: Math.floor(row.wave),
+                ship: typeof row.ship === "string" ? row.ship.substring(0, 12) : "",
+            }));
         saveHighscores(highscores);
         lastLeaderboardFetch = now;
     } catch (err) {
@@ -159,10 +175,17 @@ async function fetchLeaderboard() {
 }
 
 async function submitScore(name, sc, wv, shipName) {
+    // Client-side validation (mirrors DB constraints)
+    if (typeof name !== "string" || name.length !== NAME_LENGTH || !/^[A-Z ]+$/.test(name) || !/[A-Z]/.test(name)) return;
+    if (typeof sc !== "number" || sc <= 0 || !Number.isInteger(sc)) return;
+    if (typeof wv !== "number" || wv < 1 || !Number.isInteger(wv)) return;
+    const validShips = SHIP_TYPES.map(s => s.name);
+    if (!validShips.includes(shipName)) return;
+
     // localStorage already updated via insertHighscore before this call
     try {
         const url = `${SUPABASE_URL}/rest/v1/${LEADERBOARD_TABLE}`;
-        const res = await fetch(url, {
+        const res = await fetchWithTimeout(url, {
             method: "POST",
             headers: {
                 "apikey": SUPABASE_ANON_KEY,
@@ -179,6 +202,8 @@ async function submitScore(name, sc, wv, shipName) {
     } catch (err) {
         console.warn("Score submit failed (network):", err);
     }
+    // Delay refresh to give Supabase time to process the insert
+    await new Promise(r => setTimeout(r, 500));
     lastLeaderboardFetch = 0;
     await fetchLeaderboard();
 }
@@ -432,12 +457,19 @@ function applySplashDamage(x, y) {
     spawnSplashRing(x, y);
     sfxSplash();
 
-    // Damage nearby asteroids
+    // Snapshot indices to avoid hitting newly-spawned children
+    const targets = [];
     for (let j = asteroids.length - 1; j >= 0; j--) {
         const a = asteroids[j];
         if (dist(x, y, a.x, a.y) < SPLASH_RADIUS + a.radius) {
-            score += ASTEROID_POINTS[a.size];
-            splitAsteroid(a, j);
+            targets.push(j);
+        }
+    }
+    // Process in reverse order (highest index first) so splices don't shift remaining targets
+    for (const j of targets) {
+        if (j < asteroids.length) {
+            score += ASTEROID_POINTS[asteroids[j].size];
+            splitAsteroid(asteroids[j], j);
         }
     }
 
