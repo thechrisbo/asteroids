@@ -49,6 +49,15 @@ const MAX_HIGHSCORES = 10;
 const NAME_LENGTH = 5;
 const LS_KEY = "asteroids_top10";
 
+// ── Supabase Leaderboard ─────────────────────────────────────
+const SUPABASE_URL = "https://ddcbluicunryrafsqygf.supabase.co";
+const SUPABASE_ANON_KEY = "sb_publishable_fOY0xoYLE1YqGmF7ceEuSA_gjP9L3Yd";
+const LEADERBOARD_TABLE = "highscores";
+let leaderboardLoading = false;
+let leaderboardError = false;
+let lastLeaderboardFetch = 0;
+const LEADERBOARD_CACHE_MS = 30000;
+
 // ── Ship Types ────────────────────────────────────────────────
 const SHIP_TYPES = [
     {
@@ -105,8 +114,8 @@ function qualifiesForHighscore(sc, list) {
     return sc > list[list.length - 1].score;
 }
 
-function insertHighscore(name, sc, wv, list) {
-    const entry = { name: name.toUpperCase(), score: sc, wave: wv };
+function insertHighscore(name, sc, wv, list, shipName) {
+    const entry = { name: name.toUpperCase(), score: sc, wave: wv, ship: shipName || "" };
     list.push(entry);
     list.sort((a, b) => b.score - a.score);
     if (list.length > MAX_HIGHSCORES) list.length = MAX_HIGHSCORES;
@@ -115,6 +124,66 @@ function insertHighscore(name, sc, wv, list) {
 }
 
 let highscores = loadHighscores();
+
+// ── Supabase Leaderboard Functions ───────────────────────────
+async function fetchLeaderboard() {
+    const now = Date.now();
+    if (now - lastLeaderboardFetch < LEADERBOARD_CACHE_MS && highscores.length > 0) return;
+    leaderboardLoading = true;
+    leaderboardError = false;
+    try {
+        const url = `${SUPABASE_URL}/rest/v1/${LEADERBOARD_TABLE}?select=name,score,wave,ship&order=score.desc&limit=${MAX_HIGHSCORES}`;
+        const res = await fetch(url, {
+            headers: {
+                "apikey": SUPABASE_ANON_KEY,
+                "Authorization": `Bearer ${SUPABASE_ANON_KEY}`,
+            },
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        highscores = data.map(row => ({
+            name: row.name,
+            score: row.score,
+            wave: row.wave,
+            ship: row.ship || "",
+        }));
+        saveHighscores(highscores);
+        lastLeaderboardFetch = now;
+    } catch (err) {
+        console.warn("Leaderboard fetch failed, using local cache:", err);
+        leaderboardError = true;
+        highscores = loadHighscores();
+    } finally {
+        leaderboardLoading = false;
+    }
+}
+
+async function submitScore(name, sc, wv, shipName) {
+    // localStorage already updated via insertHighscore before this call
+    try {
+        const url = `${SUPABASE_URL}/rest/v1/${LEADERBOARD_TABLE}`;
+        const res = await fetch(url, {
+            method: "POST",
+            headers: {
+                "apikey": SUPABASE_ANON_KEY,
+                "Authorization": `Bearer ${SUPABASE_ANON_KEY}`,
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal",
+            },
+            body: JSON.stringify({ name, score: sc, wave: wv, ship: shipName }),
+        });
+        if (!res.ok) {
+            const errBody = await res.text();
+            console.warn("Score submit failed:", res.status, errBody);
+        }
+    } catch (err) {
+        console.warn("Score submit failed (network):", err);
+    }
+    lastLeaderboardFetch = 0;
+    await fetchLeaderboard();
+}
+
+fetchLeaderboard();
 
 // ── Audio ─────────────────────────────────────────────────────
 const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -701,11 +770,16 @@ function handleNameEntry() {
     }
     if (code === "Enter" && entryName.length > 0) {
         while (entryName.length < NAME_LENGTH) entryName.push(" ");
-        highscores = insertHighscore(entryName.join(""), score, wave, highscores);
+        const playerName = entryName.join("");
+        const shipName = SHIP_TYPES[selectedShip].name;
+        // Optimistic local update — instant feedback
+        highscores = insertHighscore(playerName, score, wave, highscores, shipName);
         playSound(1000, 0.15, "square", 0.12);
         setTimeout(() => playSound(1200, 0.15, "square", 0.12), 100);
         setTimeout(() => playSound(1500, 0.2, "square", 0.12), 200);
         state = "scores";
+        // Submit to global leaderboard in background
+        submitScore(playerName, score, wave, shipName);
         return;
     }
     if (entryName.length < NAME_LENGTH && key.length === 1 && /[a-zA-Z]/.test(key)) {
@@ -1121,10 +1195,17 @@ function drawTitleScreen() {
     ctx.fillStyle = "rgba(255,255,255,0.7)";
     ctx.fillText("ARROWS or WASD to move  |  SPACE to shoot", cx, cy - 45);
 
+    if (leaderboardLoading && highscores.length === 0) {
+        ctx.fillStyle = "rgba(255,255,255,0.4)";
+        ctx.font = "14px 'Courier New', monospace";
+        ctx.fillText("LOADING GLOBAL SCORES...", cx, cy + 20);
+    }
+
     if (highscores.length > 0) {
         ctx.font = "16px 'Courier New', monospace";
         ctx.fillStyle = "rgba(255,255,255,0.5)";
-        ctx.fillText("── TOP SCORES ──", cx, cy + 5);
+        const label = leaderboardError ? "── TOP SCORES (OFFLINE) ──" : "── GLOBAL TOP SCORES ──";
+        ctx.fillText(label, cx, cy + 5);
         const show = Math.min(5, highscores.length);
         for (let i = 0; i < show; i++) {
             const e = highscores[i];
@@ -1168,18 +1249,19 @@ function drawScoresScreen() {
     let y = canvas.height / 2 - 180;
 
     ctx.font = "bold 36px 'Courier New', monospace";
-    ctx.fillText("HIGH SCORES", cx, y);
+    const title = leaderboardError ? "HIGH SCORES (OFFLINE)" : "GLOBAL HIGH SCORES";
+    ctx.fillText(title, cx, y);
     y += 20;
 
     ctx.font = "14px 'Courier New', monospace";
     ctx.fillStyle = "rgba(255,255,255,0.4)";
-    ctx.fillText("RANK  NAME    SCORE    WAVE", cx, y += 25);
-    ctx.fillText("─".repeat(32), cx, y += 18);
+    ctx.fillText("RANK  NAME    SCORE    WAVE  SHIP", cx, y += 25);
+    ctx.fillText("─".repeat(38), cx, y += 18);
 
     if (highscores.length === 0) {
         ctx.fillStyle = "rgba(255,255,255,0.5)";
         ctx.font = "16px 'Courier New', monospace";
-        ctx.fillText("No scores yet. Play a game!", cx, y += 40);
+        ctx.fillText(leaderboardLoading ? "Loading..." : "No scores yet. Play a game!", cx, y += 40);
     } else {
         for (let i = 0; i < highscores.length; i++) {
             const e = highscores[i];
@@ -1187,15 +1269,16 @@ function drawScoresScreen() {
             const name = e.name.padEnd(NAME_LENGTH, " ");
             const sc = e.score.toString().padStart(7, " ");
             const wv = (e.wave || "?").toString().padStart(3, " ");
+            const sh = (e.ship || "").substring(0, 4).padEnd(4, " ");
             if (i === 0) { ctx.fillStyle = "#fff"; ctx.font = "bold 17px 'Courier New', monospace"; }
             else { ctx.fillStyle = "rgba(255,255,255,0.7)"; ctx.font = "16px 'Courier New', monospace"; }
-            ctx.fillText(`${rank}.  ${name}  ${sc}    W${wv}`, cx, y += 28);
+            ctx.fillText(`${rank}.  ${name}  ${sc}    W${wv}  ${sh}`, cx, y += 28);
         }
         for (let i = highscores.length; i < MAX_HIGHSCORES; i++) {
             const rank = (i + 1).toString().padStart(2, " ");
             ctx.fillStyle = "rgba(255,255,255,0.25)";
             ctx.font = "16px 'Courier New', monospace";
-            ctx.fillText(`${rank}.  -----  -------    W  -`, cx, y += 28);
+            ctx.fillText(`${rank}.  -----  -------    W  -  ----`, cx, y += 28);
         }
     }
 
@@ -1311,6 +1394,7 @@ function initTitleScreen() {
             "large"
         ));
     }
+    fetchLeaderboard();
 }
 
 // ── Game Loop ─────────────────────────────────────────────────
