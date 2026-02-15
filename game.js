@@ -1220,8 +1220,11 @@ function drawTitleScreen() {
     const cx = canvas.width / 2;
     const cy = canvas.height / 2;
 
-    ctx.font = "bold 64px 'Courier New', monospace";
-    ctx.fillText("ASTEROIDS", cx, cy - 100);
+    ctx.font = "bold 56px 'Courier New', monospace";
+    ctx.fillText("ASTEROIDS", cx, cy - 115);
+    ctx.font = "bold 24px 'Courier New', monospace";
+    ctx.fillStyle = "rgba(255,255,255,0.6)";
+    ctx.fillText("VECTOR FURY", cx, cy - 80);
 
     ctx.font = "18px 'Courier New', monospace";
     ctx.fillStyle = "rgba(255,255,255,0.7)";
