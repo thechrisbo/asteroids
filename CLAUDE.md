@@ -21,7 +21,7 @@ The file is organized into labeled sections (marked with `// ──` comment ban
 1. **Canvas Setup** — responsive fullscreen canvas
 2. **Constants** — tunable gameplay values (speeds, sizes, timers, scoring) plus ship-stat-driven `let` variables (`shipThrust`, `shipTurnSpeed`, `shipFireCooldown`, `shipBulletLife`)
 3. **Ship Types** — `SHIP_TYPES` array defining 3 ships (The Wave, Interstellar, Terminator) with speed/attack/range stats; `applyShipStats()` resolves stats to gameplay constants
-4. **Highscore Persistence** — top 10 via `localStorage` key `"asteroids_top10"` with name entry
+4. **Highscore Persistence** — top 10 via `localStorage` key `"asteroids_top10"` with name entry; global leaderboard via Supabase REST API (`fetchLeaderboard()`, `submitScore()`)
 5. **Audio** — Web Audio API oscillator-based sound effects (`playSound` + named `sfx*` wrappers), UFO hum oscillator
 6. **Input** — `keys` object tracking pressed state via `keydown`/`keyup`
 7. **Game State** — module-level variables; `initGame()` resets everything; factory functions for ship/asteroid/UFO/particles/splash rings
@@ -36,7 +36,8 @@ The file is organized into labeled sections (marked with `// ──` comment ban
 - Collision detection uses circle approximation (`dist < radius`)
 - Screen wrapping uses a 50px offscreen buffer so objects don't visually pop
 - Asteroids store pre-generated irregular polygon vertices (`verts` array)
-- Top 10 highscores persist via `localStorage` key `"asteroids_top10"` with name/score/wave
+- Top 10 highscores persist via `localStorage` key `"asteroids_top10"` with name/score/wave/ship
+- Global leaderboard via Supabase (project: `ddcbluicunryrafsqygf`). `SUPABASE_URL` and `SUPABASE_ANON_KEY` are in game.js constants. The anon key is public by design — security comes from Row Level Security (SELECT + INSERT only, no UPDATE/DELETE) and DB constraints (valid name/score/wave/ship, rate limit trigger). `localStorage` serves as offline fallback — game works without network
 - Visual style is stroke-only (no fills) for authentic vector graphics look
 - Ship selection screen (`"shipselect"` state) lets player choose from 3 ships before each game
 - Ship stats (speed/attack/range) map to gameplay constants via `applyShipStats()` — speed affects thrust & turn, attack affects fire cooldown, range affects bullet lifetime

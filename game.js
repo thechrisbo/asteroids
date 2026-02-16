@@ -23,11 +23,44 @@ const PARTICLE_COUNT = 12;
 const PARTICLE_LIFETIME = 0.8;
 const SPLASH_RADIUS = 60;
 
+// ── Item / Power-Up Constants ─────────────────────────────────
+const ASTEROID_DROP_BASE_CHANCE = 0.15;
+const ASTEROID_DROP_ESCALATION = 0.01;
+const UFO_DROP_CHANCE = 0.50;
+const ITEM_SIZE = 12;
+const ITEM_PICKUP_RADIUS = 25;
+const ITEM_LIFETIME = 15;
+const ITEM_ROTATION_SPEED = 2;
+const ITEM_PULSE_SPEED = 3;
+const ITEM_TYPES = ["speed", "bomb", "pistol", "lightning", "gravityBoom"];
+const ITEM_COLORS = {
+    speed: "#0ff",
+    bomb: "#f80",
+    pistol: "#ff0",
+    lightning: "#88f",
+    gravityBoom: "#f0f",
+};
+const ITEM_LABELS = {
+    speed: "SPD",
+    bomb: "BOM",
+    pistol: "WPN",
+    lightning: "ZAP",
+    gravityBoom: "GRV",
+};
+const MARK_SPEED_BONUS = { 1: 1, 2: 2, 3: 3 };
+const MARK_BOMB_RADIUS = { 1: 15, 2: 18, 3: 20 };
+const LIGHTNING_RADIUS = { 1: 80, 2: 160, 3: 320 };
+const LIGHTNING_DURATION = 10;
+const GRAVITY_BOOM_COOLDOWN = 30;
+const GRAVITY_BOOM_BASE_RADIUS = 150;
+const GRAVITY_BOOM_RADIUS_PER_PICKUP = 50;
+
 // Ship-stat-driven values (set by applyShipStats)
 let shipThrust = 300;
 let shipTurnSpeed = 5;
 let shipFireCooldown = 0.15;
 let shipBulletLife = 1.2;
+let shipSplashRadius = SPLASH_RADIUS;
 
 // UFO constants
 const UFO_SPAWN_INTERVAL_BASE = 15;
@@ -82,9 +115,18 @@ const SHIP_TYPES = [
 
 function applyShipStats(shipType) {
     const t = shipType;
+    // Speed bonus from items
+    let speedBonus = 0;
+    if (itemInventory) {
+        const si = itemInventory.speed;
+        for (let i = 0; i < si.count; i++) {
+            speedBonus += MARK_SPEED_BONUS[si.mark] || 1;
+        }
+    }
+    const effectiveSpeed = t.speed + speedBonus;
     // Speed 5 = base (300 thrust, 5 turn). Each point ±15% thrust, ±10% turn.
-    shipThrust = 300 * (1 + (t.speed - 5) * 0.15);
-    shipTurnSpeed = 5 * (1 + (t.speed - 5) * 0.10);
+    shipThrust = 300 * (1 + (effectiveSpeed - 5) * 0.15);
+    shipTurnSpeed = 5 * (1 + (effectiveSpeed - 5) * 0.10);
     // Attack 5 = 0.15s cooldown. Each point -0.015s (lower = faster).
     shipFireCooldown = Math.max(0.05, 0.15 - (t.attack - 5) * 0.015);
     // Range 5 = 1.2s bullet life. Each point ±0.15s.
@@ -247,6 +289,19 @@ function sfxConfirm() {
     setTimeout(() => playSound(1000, 0.12, "square", 0.12), 80);
 }
 function sfxSplash() { playSound(200, 0.25, "sawtooth", 0.18); }
+function sfxItemDrop() { playSound(1200, 0.15, "sine", 0.08); }
+function sfxItemCollect() {
+    playSound(600, 0.1, "square", 0.1);
+    setTimeout(() => playSound(900, 0.12, "square", 0.1), 60);
+}
+function sfxLightningActivate() {
+    playSound(150, 0.3, "sawtooth", 0.15);
+    setTimeout(() => playSound(300, 0.2, "square", 0.12), 80);
+}
+function sfxGravityBoom() {
+    playSound(80, 0.5, "sawtooth", 0.2);
+    setTimeout(() => playSound(40, 0.6, "sine", 0.15), 100);
+}
 
 let ufoHumOsc = null;
 let ufoHumGain = null;
@@ -285,7 +340,7 @@ let lastKeyDown = null;
 window.addEventListener("keydown", (e) => {
     keys[e.code] = true;
     lastKeyDown = e;
-    if (["Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.code)) {
+    if (["Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "KeyQ", "KeyE"].includes(e.code)) {
         e.preventDefault();
     }
     if (e.code === "Backspace") e.preventDefault();
@@ -309,6 +364,23 @@ let selectInputCooldown;
 // Name entry state
 let entryName, entryCursorBlink, nameEntryRank;
 
+// Item / Power-Up state
+let items; // floating pickups on screen
+let dropChanceEscalation;
+let itemInventory;
+let lightningActive, lightningTimer, lightningRadius;
+let gravityBoomCooldown, gravityBoomRadius;
+
+function createDefaultInventory() {
+    return {
+        speed: { mark: 0, count: 0 },
+        bomb: { mark: 0, count: 0 },
+        pistol: { mark: 0, count: 0 },
+        lightning: { mark: 0, uses: 0 },
+        gravityBoom: { mark: 0, count: 0, ready: true },
+    };
+}
+
 function initGame() {
     applyShipStats(SHIP_TYPES[selectedShip]);
     ship = createShip();
@@ -328,6 +400,15 @@ function initGame() {
     thrustSoundTimer = 0;
     waveBannerTimer = 0;
     speedMultiplier = 1.0;
+    items = [];
+    dropChanceEscalation = 0;
+    itemInventory = createDefaultInventory();
+    lightningActive = false;
+    lightningTimer = 0;
+    lightningRadius = 0;
+    gravityBoomCooldown = 0;
+    gravityBoomRadius = GRAVITY_BOOM_BASE_RADIUS;
+    shipSplashRadius = SPLASH_RADIUS;
     stopUFOHum();
     spawnWave();
 }
@@ -366,6 +447,7 @@ function createAsteroid(x, y, size) {
 
 function spawnWave() {
     wave++;
+    dropChanceEscalation = 0;
     speedMultiplier = Math.min(2.0, 1.0 + (wave - 1) * 0.08);
     const interval = Math.max(UFO_SPAWN_INTERVAL_MIN, UFO_SPAWN_INTERVAL_BASE - (wave - 1) * 0.8);
     ufoSpawnTimer = interval;
@@ -406,6 +488,85 @@ function getUFOType() {
     return Math.random() < smallProb ? "small" : "large";
 }
 
+// ── Item / Power-Up System ────────────────────────────────────
+function createItem(x, y, type, mark) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 15 + Math.random() * 25;
+    return {
+        x, y,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed,
+        type, mark,
+        rotation: Math.random() * Math.PI * 2,
+        pulsePhase: Math.random() * Math.PI * 2,
+        radius: ITEM_SIZE,
+        life: ITEM_LIFETIME,
+        maxLife: ITEM_LIFETIME,
+    };
+}
+
+function determineItemDrop(isUFO) {
+    const chance = isUFO ? UFO_DROP_CHANCE : (ASTEROID_DROP_BASE_CHANCE + dropChanceEscalation);
+    if (Math.random() > chance) return null;
+    const type = ITEM_TYPES[Math.floor(Math.random() * ITEM_TYPES.length)];
+    const inv = itemInventory[type];
+    let mark;
+    if (inv.mark === 0) mark = 1;
+    else if (inv.mark === 1) mark = Math.random() < 0.6 ? 1 : 2;
+    else if (inv.mark === 2) mark = Math.random() < 0.4 ? 2 : 3;
+    else mark = 3;
+    return { type, mark };
+}
+
+function spawnItemDrop(x, y, isUFO) {
+    const drop = determineItemDrop(isUFO);
+    if (!drop) {
+        if (!isUFO) dropChanceEscalation += ASTEROID_DROP_ESCALATION;
+        return;
+    }
+    items.push(createItem(x, y, drop.type, drop.mark));
+    sfxItemDrop();
+    if (!isUFO) dropChanceEscalation = 0;
+}
+
+function collectItem(item) {
+    const inv = itemInventory[item.type];
+    if (item.mark > inv.mark) inv.mark = item.mark;
+    if (item.type === "lightning") {
+        inv.uses++;
+        lightningRadius = LIGHTNING_RADIUS[inv.mark];
+    } else if (item.type === "gravityBoom") {
+        inv.count++;
+        gravityBoomRadius = GRAVITY_BOOM_BASE_RADIUS + (inv.count - 1) * GRAVITY_BOOM_RADIUS_PER_PICKUP;
+        if (!inv.ready && gravityBoomCooldown > 0) {
+            // keep existing cooldown
+        } else {
+            inv.ready = true;
+        }
+    } else {
+        inv.count++;
+    }
+    // Re-apply stats for speed/bomb changes
+    if (item.type === "speed" || item.type === "bomb") {
+        reapplyItemStats();
+    }
+    sfxItemCollect();
+}
+
+function reapplyItemStats() {
+    applyShipStats(SHIP_TYPES[selectedShip]);
+    // Bomb radius
+    const bombInv = itemInventory.bomb;
+    if (bombInv.count > 0) {
+        shipSplashRadius = SPLASH_RADIUS;
+        for (let i = 0; i < bombInv.count; i++) {
+            shipSplashRadius += MARK_BOMB_RADIUS[bombInv.mark] || MARK_BOMB_RADIUS[1];
+        }
+    } else {
+        shipSplashRadius = SPLASH_RADIUS;
+    }
+}
+
 // ── Particles & Splash Rings ──────────────────────────────────
 function spawnExplosion(x, y, count) {
     for (let i = 0; i < count; i++) {
@@ -420,11 +581,11 @@ function spawnExplosion(x, y, count) {
     }
 }
 
-function spawnSplashRing(x, y) {
+function spawnSplashRing(x, y, maxR) {
     splashRings.push({
         x, y,
         radius: 5,
-        maxRadius: SPLASH_RADIUS,
+        maxRadius: maxR || SPLASH_RADIUS,
         life: 0.4,
         maxLife: 0.4,
     });
@@ -448,20 +609,20 @@ function wrapVertical(obj) {
 }
 
 function hasSpecialSplash() {
-    return SHIP_TYPES[selectedShip].special === "splash";
+    return SHIP_TYPES[selectedShip].special === "splash" || (itemInventory && itemInventory.bomb.count > 0);
 }
 
 // ── Splash Damage (Terminator) ────────────────────────────────
 function applySplashDamage(x, y) {
     if (!hasSpecialSplash()) return;
-    spawnSplashRing(x, y);
+    spawnSplashRing(x, y, shipSplashRadius);
     sfxSplash();
 
     // Snapshot indices to avoid hitting newly-spawned children
     const targets = [];
     for (let j = asteroids.length - 1; j >= 0; j--) {
         const a = asteroids[j];
-        if (dist(x, y, a.x, a.y) < SPLASH_RADIUS + a.radius) {
+        if (dist(x, y, a.x, a.y) < shipSplashRadius + a.radius) {
             targets.push(j);
         }
     }
@@ -474,11 +635,138 @@ function applySplashDamage(x, y) {
     }
 
     // Damage UFO if in range
-    if (ufo && dist(x, y, ufo.x, ufo.y) < SPLASH_RADIUS + ufo.radius) {
+    if (ufo && dist(x, y, ufo.x, ufo.y) < shipSplashRadius + ufo.radius) {
         score += UFO_POINTS[ufo.type];
         spawnExplosion(ufo.x, ufo.y, 16);
         sfxUFOExplosion();
         destroyUFO(true);
+    }
+}
+
+// ── Multi-Weapon System ───────────────────────────────────────
+function getTotalWeapons() {
+    return 1 + (itemInventory ? itemInventory.pistol.count : 0);
+}
+
+function getWeaponAngles(baseAngle, count) {
+    if (count <= 1) return [baseAngle];
+    // Cone widens with more guns: ±5° at 2-3, growing ~3° per additional gun, capped at ±45°
+    const halfSpreadDeg = Math.min(45, 5 + (count - 2) * 3);
+    const halfSpread = (halfSpreadDeg * Math.PI) / 180;
+    const angles = [];
+    for (let i = 0; i < count; i++) {
+        const offset = ((i / (count - 1)) - 0.5) * 2 * halfSpread;
+        angles.push(baseAngle + offset);
+    }
+    return angles;
+}
+
+function fireMultiWeapon() {
+    const count = getTotalWeapons();
+    const angles = getWeaponAngles(ship.angle, count);
+    for (const a of angles) {
+        bullets.push({
+            x: ship.x + Math.cos(a) * SHIP_SIZE,
+            y: ship.y + Math.sin(a) * SHIP_SIZE,
+            vx: Math.cos(a) * BULLET_SPEED + ship.vx * 0.3,
+            vy: Math.sin(a) * BULLET_SPEED + ship.vy * 0.3,
+            life: shipBulletLife,
+        });
+    }
+}
+
+// ── Activated Abilities ───────────────────────────────────────
+function activateLightning() {
+    if (!itemInventory || itemInventory.lightning.uses <= 0) return;
+    itemInventory.lightning.uses--;
+    lightningActive = true;
+    lightningTimer = LIGHTNING_DURATION;
+    lightningRadius = LIGHTNING_RADIUS[itemInventory.lightning.mark] || 80;
+    sfxLightningActivate();
+}
+
+function updateLightning(dt) {
+    if (!lightningActive) return;
+    lightningTimer -= dt;
+    if (lightningTimer <= 0) {
+        lightningActive = false;
+        lightningTimer = 0;
+        return;
+    }
+    if (!ship.alive) return;
+    // Damage asteroids in radius
+    for (let j = asteroids.length - 1; j >= 0; j--) {
+        const a = asteroids[j];
+        if (dist(ship.x, ship.y, a.x, a.y) < lightningRadius + a.radius) {
+            score += ASTEROID_POINTS[a.size];
+            spawnExplosion(a.x, a.y, 6);
+            splitAsteroid(a, j);
+        }
+    }
+    // Damage UFO in radius
+    if (ufo && dist(ship.x, ship.y, ufo.x, ufo.y) < lightningRadius + ufo.radius) {
+        score += UFO_POINTS[ufo.type];
+        spawnExplosion(ufo.x, ufo.y, 16);
+        sfxUFOExplosion();
+        destroyUFO(true);
+    }
+    // Destroy UFO bullets in radius
+    for (let i = ufoBullets.length - 1; i >= 0; i--) {
+        const b = ufoBullets[i];
+        if (dist(ship.x, ship.y, b.x, b.y) < lightningRadius) {
+            spawnExplosion(b.x, b.y, 3);
+            ufoBullets.splice(i, 1);
+        }
+    }
+}
+
+function activateGravityBoom() {
+    if (!itemInventory || itemInventory.gravityBoom.count <= 0 || !itemInventory.gravityBoom.ready) return;
+    itemInventory.gravityBoom.ready = false;
+    gravityBoomCooldown = GRAVITY_BOOM_COOLDOWN;
+    sfxGravityBoom();
+    spawnSplashRing(ship.x, ship.y, gravityBoomRadius);
+    // Push asteroids away
+    for (const a of asteroids) {
+        const d = dist(ship.x, ship.y, a.x, a.y);
+        if (d < gravityBoomRadius && d > 0) {
+            const force = (1 - d / gravityBoomRadius) * 400;
+            const angle = Math.atan2(a.y - ship.y, a.x - ship.x);
+            a.vx += Math.cos(angle) * force;
+            a.vy += Math.sin(angle) * force;
+        }
+    }
+    // Push UFO away
+    if (ufo) {
+        const d = dist(ship.x, ship.y, ufo.x, ufo.y);
+        if (d < gravityBoomRadius && d > 0) {
+            const force = (1 - d / gravityBoomRadius) * 400;
+            const angle = Math.atan2(ufo.y - ship.y, ufo.x - ship.x);
+            ufo.vx += Math.cos(angle) * force;
+            ufo.vy += Math.sin(angle) * force;
+        }
+    }
+    // Deflect UFO bullets
+    for (const b of ufoBullets) {
+        const d = dist(ship.x, ship.y, b.x, b.y);
+        if (d < gravityBoomRadius && d > 0) {
+            const force = (1 - d / gravityBoomRadius) * 300;
+            const angle = Math.atan2(b.y - ship.y, b.x - ship.x);
+            b.vx += Math.cos(angle) * force;
+            b.vy += Math.sin(angle) * force;
+        }
+    }
+}
+
+function updateGravityBoomCooldown(dt) {
+    if (gravityBoomCooldown > 0) {
+        gravityBoomCooldown -= dt;
+        if (gravityBoomCooldown <= 0) {
+            gravityBoomCooldown = 0;
+            if (itemInventory && itemInventory.gravityBoom.count > 0) {
+                itemInventory.gravityBoom.ready = true;
+            }
+        }
     }
 }
 
@@ -594,16 +882,20 @@ function update(dt) {
         wrap(ship);
 
         shootCooldown -= dt;
-        if (keys["Space"] && shootCooldown <= 0 && bullets.length < MAX_BULLETS) {
-            bullets.push({
-                x: ship.x + Math.cos(ship.angle) * SHIP_SIZE,
-                y: ship.y + Math.sin(ship.angle) * SHIP_SIZE,
-                vx: Math.cos(ship.angle) * BULLET_SPEED + ship.vx * 0.3,
-                vy: Math.sin(ship.angle) * BULLET_SPEED + ship.vy * 0.3,
-                life: shipBulletLife,
-            });
+        if (keys["Space"] && shootCooldown <= 0) {
+            fireMultiWeapon();
             shootCooldown = shipFireCooldown;
             sfxShoot();
+        }
+
+        // Activated abilities
+        if (keys["KeyQ"]) {
+            keys["KeyQ"] = false;
+            activateLightning();
+        }
+        if (keys["KeyE"]) {
+            keys["KeyE"] = false;
+            activateGravityBoom();
         }
 
         if (invincibleTimer > 0) invincibleTimer -= dt;
@@ -688,6 +980,7 @@ function update(dt) {
                 score += ASTEROID_POINTS[a.size];
                 splitAsteroid(a, j);
                 applySplashDamage(hitX, hitY);
+                spawnItemDrop(hitX, hitY, false);
                 break;
             }
         }
@@ -699,10 +992,12 @@ function update(dt) {
             const b = bullets[i];
             if (dist(b.x, b.y, ufo.x, ufo.y) < ufo.radius) {
                 const hitX = b.x, hitY = b.y;
+                const ufoHitX = ufo.x, ufoHitY = ufo.y;
                 bullets.splice(i, 1);
                 score += UFO_POINTS[ufo.type];
                 spawnExplosion(ufo.x, ufo.y, 16);
                 sfxUFOExplosion();
+                spawnItemDrop(ufoHitX, ufoHitY, true);
                 destroyUFO(true);
                 applySplashDamage(hitX, hitY);
                 break;
@@ -765,6 +1060,31 @@ function update(dt) {
             }
         }
     }
+
+    // Items (floating pickups)
+    for (let i = items.length - 1; i >= 0; i--) {
+        const it = items[i];
+        it.x += it.vx * dt;
+        it.y += it.vy * dt;
+        it.vx *= Math.pow(0.98, dt * 60); // slow down over time
+        it.vy *= Math.pow(0.98, dt * 60);
+        it.rotation += ITEM_ROTATION_SPEED * dt;
+        it.pulsePhase += ITEM_PULSE_SPEED * dt;
+        it.life -= dt;
+        wrap(it);
+        if (it.life <= 0) { items.splice(i, 1); continue; }
+        // Ship pickup collision
+        if (ship.alive && dist(ship.x, ship.y, it.x, it.y) < ITEM_PICKUP_RADIUS + ship.radius) {
+            collectItem(it);
+            items.splice(i, 1);
+        }
+    }
+
+    // Lightning aura
+    updateLightning(dt);
+
+    // Gravity Boom cooldown
+    updateGravityBoomCooldown(dt);
 
     // Particles
     for (let i = particles.length - 1; i >= 0; i--) {
@@ -923,6 +1243,12 @@ function draw() {
         ctx.stroke();
     }
 
+    // Items
+    drawItems();
+
+    // Lightning aura
+    drawLightningAura();
+
     ctx.fillStyle = "#fff";
     drawHUD();
     if (waveBannerTimer > 0) drawWaveBanner();
@@ -1062,6 +1388,106 @@ function drawUFO(u) {
     ctx.restore();
 }
 
+// ── Item Drawing ──────────────────────────────────────────────
+function drawItem(item) {
+    const alpha = item.life < 3 ? item.life / 3 : 1;
+    const pulse = 1 + Math.sin(item.pulsePhase) * 0.15;
+    const s = ITEM_SIZE * pulse;
+    const color = ITEM_COLORS[item.type];
+
+    ctx.save();
+    ctx.translate(item.x, item.y);
+    ctx.rotate(item.rotation);
+    ctx.globalAlpha = alpha;
+
+    // Mark rings (1-3 concentric)
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1;
+    for (let m = 0; m < item.mark; m++) {
+        const r = s + 4 + m * 5;
+        ctx.beginPath();
+        ctx.arc(0, 0, r, 0, Math.PI * 2);
+        ctx.stroke();
+    }
+
+    // Type symbol
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    if (item.type === "speed") {
+        // Arrow triangle
+        ctx.moveTo(s * 0.7, 0);
+        ctx.lineTo(-s * 0.5, -s * 0.5);
+        ctx.lineTo(-s * 0.2, 0);
+        ctx.lineTo(-s * 0.5, s * 0.5);
+        ctx.closePath();
+    } else if (item.type === "bomb") {
+        // 8-ray starburst
+        for (let i = 0; i < 8; i++) {
+            const a = (i / 8) * Math.PI * 2;
+            ctx.moveTo(0, 0);
+            ctx.lineTo(Math.cos(a) * s * 0.7, Math.sin(a) * s * 0.7);
+        }
+    } else if (item.type === "pistol") {
+        // Crosshair
+        ctx.moveTo(-s * 0.6, 0); ctx.lineTo(s * 0.6, 0);
+        ctx.moveTo(0, -s * 0.6); ctx.lineTo(0, s * 0.6);
+        ctx.moveTo(0, 0);
+        ctx.arc(0, 0, s * 0.4, 0, Math.PI * 2);
+    } else if (item.type === "lightning") {
+        // Zigzag bolt
+        ctx.moveTo(-s * 0.2, -s * 0.7);
+        ctx.lineTo(s * 0.15, -s * 0.15);
+        ctx.lineTo(-s * 0.1, -s * 0.1);
+        ctx.lineTo(s * 0.2, s * 0.7);
+    } else if (item.type === "gravityBoom") {
+        // Circle with outward arrows
+        ctx.arc(0, 0, s * 0.35, 0, Math.PI * 2);
+        ctx.moveTo(s * 0.5, 0); ctx.lineTo(s * 0.8, 0);
+        ctx.moveTo(-s * 0.5, 0); ctx.lineTo(-s * 0.8, 0);
+        ctx.moveTo(0, s * 0.5); ctx.lineTo(0, s * 0.8);
+        ctx.moveTo(0, -s * 0.5); ctx.lineTo(0, -s * 0.8);
+    }
+    ctx.stroke();
+
+    ctx.globalAlpha = 1;
+    ctx.restore();
+}
+
+function drawItems() {
+    for (const item of items) drawItem(item);
+}
+
+function drawLightningAura() {
+    if (!lightningActive || !ship.alive) return;
+    const t = Date.now() / 200;
+    const pulseAlpha = 0.15 + Math.sin(t) * 0.1;
+
+    ctx.save();
+    // Outer ring
+    ctx.strokeStyle = `rgba(136,136,255,${pulseAlpha + 0.15})`;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(ship.x, ship.y, lightningRadius, 0, Math.PI * 2);
+    ctx.stroke();
+    // Inner pulse ring
+    ctx.strokeStyle = `rgba(136,136,255,${pulseAlpha})`;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(ship.x, ship.y, lightningRadius * 0.7, 0, Math.PI * 2);
+    ctx.stroke();
+    // Random arcs for visual flair
+    ctx.strokeStyle = `rgba(170,170,255,${pulseAlpha + 0.1})`;
+    ctx.lineWidth = 1;
+    for (let i = 0; i < 3; i++) {
+        const a = ((t * 0.7 + i * 2.1) % (Math.PI * 2));
+        ctx.beginPath();
+        ctx.arc(ship.x, ship.y, lightningRadius * (0.4 + Math.random() * 0.5), a, a + 0.5);
+        ctx.stroke();
+    }
+    ctx.restore();
+}
+
 // ── HUD ───────────────────────────────────────────────────────
 function drawHUD() {
     ctx.save();
@@ -1082,6 +1508,72 @@ function drawHUD() {
     for (let i = 0; i < lives; i++) {
         drawShipMiniIcon(30 + i * 25, 65, selectedShip);
     }
+
+    // Item inventory display (left side below lives)
+    if (itemInventory) {
+        ctx.textAlign = "left";
+        ctx.font = "12px 'Courier New', monospace";
+        let iy = 90;
+        const inv = itemInventory;
+        if (inv.speed.count > 0) {
+            ctx.fillStyle = ITEM_COLORS.speed;
+            ctx.fillText(`SPD +${inv.speed.count * (MARK_SPEED_BONUS[inv.speed.mark] || 1)}`, 20, iy);
+            iy += 16;
+        }
+        if (inv.bomb.count > 0) {
+            ctx.fillStyle = ITEM_COLORS.bomb;
+            ctx.fillText(`BOM x${inv.bomb.count}`, 20, iy);
+            iy += 16;
+        }
+        if (inv.pistol.count > 0) {
+            ctx.fillStyle = ITEM_COLORS.pistol;
+            ctx.fillText(`WPN x${getTotalWeapons()}`, 20, iy);
+            iy += 16;
+        }
+        if (inv.lightning.mark > 0) {
+            ctx.fillStyle = lightningActive ? "#fff" : ITEM_COLORS.lightning;
+            ctx.fillText(`[Q] ZAP x${inv.lightning.uses}`, 20, iy);
+            iy += 16;
+        }
+        if (inv.gravityBoom.count > 0) {
+            ctx.fillStyle = inv.gravityBoom.ready ? ITEM_COLORS.gravityBoom : "rgba(255,0,255,0.4)";
+            const label = inv.gravityBoom.ready ? "[E] READY" : `[E] ${Math.ceil(gravityBoomCooldown)}s`;
+            ctx.fillText(label, 20, iy);
+            iy += 16;
+        }
+    }
+
+    // Active effect timers (right side below wave)
+    ctx.textAlign = "right";
+    ctx.font = "12px 'Courier New', monospace";
+    let ry = 60;
+    if (lightningActive) {
+        ctx.fillStyle = ITEM_COLORS.lightning;
+        const barW = 60;
+        const barH = 6;
+        const rx = canvas.width - 20 - barW;
+        ctx.fillText("ZAP", rx - 5, ry + barH);
+        // Bar background
+        ctx.fillStyle = "rgba(136,136,255,0.2)";
+        ctx.fillRect(rx, ry, barW, barH);
+        // Bar fill
+        ctx.fillStyle = ITEM_COLORS.lightning;
+        ctx.fillRect(rx, ry, barW * (lightningTimer / LIGHTNING_DURATION), barH);
+        ry += 18;
+    }
+    if (gravityBoomCooldown > 0) {
+        ctx.fillStyle = "rgba(255,0,255,0.5)";
+        const barW = 60;
+        const barH = 6;
+        const rx = canvas.width - 20 - barW;
+        ctx.fillText("GRV", rx - 5, ry + barH);
+        ctx.fillStyle = "rgba(255,0,255,0.15)";
+        ctx.fillRect(rx, ry, barW, barH);
+        ctx.fillStyle = "rgba(255,0,255,0.5)";
+        ctx.fillRect(rx, ry, barW * (1 - gravityBoomCooldown / GRAVITY_BOOM_COOLDOWN), barH);
+        ry += 18;
+    }
+
     ctx.restore();
 }
 
@@ -1419,6 +1911,11 @@ function initTitleScreen() {
     splashRings = [];
     ufoBullets = [];
     ufo = null;
+    items = [];
+    dropChanceEscalation = 0;
+    lightningActive = false;
+    lightningTimer = 0;
+    gravityBoomCooldown = 0;
     speedMultiplier = 1.0;
     selectedShip = 0;
     stopUFOHum();
